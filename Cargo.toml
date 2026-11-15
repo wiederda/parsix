@@ -1,0 +1,15 @@
+# Cargo.toml
+[package]
+name = "parsix"
+version = "0.2.0"
+edition = "2021"
+description = "Kleines GUI-Tool zum Parsen und Formatieren von JSON, XML und YAML"
+
+[dependencies]
+eframe = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+quick-xml = "0.37"
+rfd = "0.15"
+regex = "1.13.1"
