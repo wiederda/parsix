@@ -4,6 +4,8 @@
 
 Der Fokus liegt auf einer einfachen Bedienung, einer direkten Bearbeitung der Inhalte und einer schnellen Formatierung ohne unnötige Zusatzfunktionen.
 
+![Screenshot](Screenshot.png)
+
 ## Funktionen
 
 ### Oberfläche (Ribbon)
