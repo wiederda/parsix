@@ -211,7 +211,10 @@ struct XmlNode {
 
 fn xml_to_value(src: &str) -> Result<Value, FmtErr> {
     let mut r = Reader::from_str(src);
-    r.config_mut().trim_text(true);
+    // XML-Whitespace kann in Textknoten bedeutungstragend sein (z. B.
+    // `<name> Ada </name>`). Beim Einlesen nicht trimmen, damit die
+    // Konvertierung führende und nachgestellte Leerzeichen erhält.
+    r.config_mut().trim_text(false);
     let mut stack: Vec<XmlNode> = Vec::new();
     let mut roots: Vec<XmlNode> = Vec::new();
     loop {
@@ -309,7 +312,10 @@ fn node_to_value(node: &XmlNode) -> Value {
     for (k, v) in &node.attrs {
         entries.push((format!("@{k}"), Value::Str(v.clone())));
     }
-    if !node.text.is_empty() {
+    // Whitespace-only text between child elements is normally formatting
+    // indentation. Keep it for leaf elements, where it is the element's
+    // actual text value, but omit it from element-only content.
+    if !node.text.is_empty() && (!node.text.trim().is_empty() || node.children.is_empty()) {
         entries.push(("#text".into(), Value::Str(node.text.clone())));
     }
     // Gleichnamige Kinderelemente werden in Dokumentreihenfolge gruppiert.

@@ -2015,8 +2015,16 @@ impl HighlightCache {
 
 /// Zustand der geteilten Vergleichsansicht.
 struct CompareState {
-    /// Linke Seite (Alt). Sie ist ein Vergleichsstand und wird nicht gespeichert.
+    /// Linke Seite (Alt), unabhängig vom Hauptdokument bearbeitbar.
     left: String,
+    left_saved_text: String,
+    left_title: String,
+    left_fmt: Fmt,
+    left_history: History,
+    left_cursor: usize,
+    left_restore_cursor: bool,
+    left_selection: Option<(usize, usize)>,
+    right_selection: Option<(usize, usize)>,
     left_hl: HighlightCache,
     right_hl: HighlightCache,
     diff: DiffResult,
@@ -2032,9 +2040,17 @@ struct CompareState {
 }
 
 impl CompareState {
-    fn new(left: String, side_by_side: bool) -> Self {
+    fn new(left: String, side_by_side: bool, left_fmt: Fmt) -> Self {
         Self {
+            left_history: History::new(&left, 0),
+            left_saved_text: left.clone(),
             left,
+            left_title: "Alt".into(),
+            left_fmt,
+            left_cursor: 0,
+            left_restore_cursor: false,
+            left_selection: None,
+            right_selection: None,
             left_hl: HighlightCache::default(),
             right_hl: HighlightCache::default(),
             diff: DiffResult::default(),
@@ -2052,7 +2068,9 @@ struct PaneOutput {
     id: egui::Id,
     offset: f32,
     hovered: bool,
+    focused: bool,
     cursor: usize,
+    selection: Option<(usize, usize)>,
     changed: bool,
 }
 
@@ -2081,7 +2099,9 @@ fn compare_pane(
         id: egui::Id::NULL,
         offset: scroll,
         hovered: false,
+        focused: false,
         cursor,
+        selection: None,
         changed: false,
     };
     ui.vertical(|ui| {
@@ -2141,11 +2161,14 @@ fn compare_pane(
                     }
                     let mut te = edit.show(ui);
                     out.id = te.response.id;
+                    out.focused = te.response.has_focus();
                     out.changed = te.response.changed();
 
                     if editable && restore_cursor {
                         let chars = text.chars().count();
                         let idx = cursor.min(chars);
+                        te.response.request_focus();
+                        out.focused = true;
                         te.state
                             .cursor
                             .set_char_range(Some(CCursorRange::one(CCursor::new(idx))));
@@ -2153,6 +2176,11 @@ fn compare_pane(
                         out.cursor = idx;
                     } else if let Some(range) = te.cursor_range {
                         out.cursor = range.primary.ccursor.index;
+                        let a = range.primary.ccursor.index;
+                        let b = range.secondary.ccursor.index;
+                        if a != b {
+                            out.selection = Some((a.min(b), a.max(b)));
+                        }
                     }
 
                     let rows = te.galley.rows.len().max(1);
@@ -2410,6 +2438,7 @@ struct App {
     last_autosave: f64,
     // Vorher-/Nachher-Vergleich
     compare: Option<CompareState>,
+    compare_left_focused: bool,
     // Formatkonvertierung
     convert_window: bool,
     convert_target: Fmt,
@@ -2637,12 +2666,34 @@ impl App {
     }
 
     fn undo(&mut self) {
+        if self.compare_left_focused {
+            if let Some(cmp) = self.compare.as_mut() {
+                if let Some(snapshot) = cmp.left_history.undo(&cmp.left, cmp.left_cursor) {
+                    cmp.left = snapshot.text;
+                    cmp.left_cursor = snapshot.cursor;
+                    cmp.left_restore_cursor = true;
+                    cmp.diff_dirty = true;
+                }
+            }
+            return;
+        }
         if let Some(s) = self.history.undo(&self.text, self.cursor) {
             self.apply_snapshot(s);
         }
     }
 
     fn redo(&mut self) {
+        if self.compare_left_focused {
+            if let Some(cmp) = self.compare.as_mut() {
+                if let Some(snapshot) = cmp.left_history.redo(&cmp.left, cmp.left_cursor) {
+                    cmp.left = snapshot.text;
+                    cmp.left_cursor = snapshot.cursor;
+                    cmp.left_restore_cursor = true;
+                    cmp.diff_dirty = true;
+                }
+            }
+            return;
+        }
         if let Some(s) = self.history.redo(&self.text, self.cursor) {
             self.apply_snapshot(s);
         }
@@ -2752,7 +2803,7 @@ impl App {
                 self.search_dirty = true;
                 self.msg = format!("Konvertiert: {} → {}", source.name(), target.name());
                 if compare {
-                    self.open_compare(original);
+                    self.open_compare_with_format(original, source);
                 }
                 self.commit_undo();
             }
@@ -2799,21 +2850,49 @@ impl App {
 
     /// Öffnet die geteilte Vergleichsansicht mit dem angegebenen linken Inhalt.
     fn open_compare(&mut self, left: String) {
-        let mut cmp = CompareState::new(left, self.settings.compare_side_by_side);
+        self.open_compare_with_format(left, self.fmt);
+    }
+
+    fn open_compare_with_format(&mut self, left: String, left_fmt: Fmt) {
+        let mut cmp = CompareState::new(left, self.settings.compare_side_by_side, left_fmt);
         cmp.diff = diff_lines(&cmp.left, &self.text);
         cmp.diff_dirty = false;
         cmp.change_idx = if cmp.diff.is_empty() { None } else { Some(0) };
         cmp.jump = !cmp.diff.is_empty();
         self.compare = Some(cmp);
+        self.compare_left_focused = false;
         self.ribbon_tab = RibbonTab::Vergleichen;
         self.ribbon_collapsed = false;
         // Cursor der rechten Ansicht an der bisherigen Position halten.
         self.restore_cursor = true;
     }
 
+    /// Vergleicht die aktuelle Ansicht mit einer zusätzlich ausgewählten Datei.
+    fn compare_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(left) => {
+                let left_fmt = Self::fmt_for_path(&path, self.fmt);
+                self.open_compare_with_format(left, left_fmt);
+                if let Some(cmp) = self.compare.as_mut() {
+                    cmp.left_title = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Datei")
+                        .to_owned();
+                }
+                self.msg = format!("Dateivergleich mit {} geöffnet.", path.display());
+            }
+            Err(e) => self.msg = format!("Vergleichsdatei konnte nicht geöffnet werden: {e}"),
+        }
+    }
+
     /// Schließt die Vergleichsansicht; der rechte Inhalt bleibt erhalten.
     fn close_compare(&mut self) {
         if self.compare.take().is_some() {
+            self.compare_left_focused = false;
             self.msg = "Vergleich beendet.".into();
         }
     }
@@ -2845,6 +2924,183 @@ impl App {
         };
         cmp.change_idx = Some(idx);
         cmp.jump = true;
+    }
+
+    /// Übernimmt einen Änderungsblock aus «Alt» in den bearbeitbaren Stand
+    /// «Neu». Die Zeilenpositionen stammen aus dem zuletzt berechneten Diff.
+    fn take_compare_change(&mut self, index: Option<usize>, left_to_right: bool) {
+        let Some(cmp) = self.compare.as_ref() else {
+            return;
+        };
+        let blocks: Vec<ChangeBlock> = match index {
+            Some(i) => cmp.diff.changes.get(i).copied().into_iter().collect(),
+            None => cmp.diff.changes.clone(),
+        };
+        let left: Vec<String> = cmp.left.split('\n').map(str::to_owned).collect();
+        if blocks.is_empty() {
+            return;
+        }
+        if left_to_right {
+            self.commit_undo();
+            let mut target: Vec<String> = self.text.split('\n').map(str::to_owned).collect();
+            for block in blocks.iter().rev() {
+                let start = block.right_start.min(target.len());
+                let end = start.saturating_add(block.right_len).min(target.len());
+                let source_end = block.left_start.saturating_add(block.left_len).min(left.len());
+                let replacement = left[block.left_start.min(left.len())..source_end].to_vec();
+                target.splice(start..end, replacement);
+            }
+            self.text = target.join("\n");
+            self.cursor = self.cursor.min(self.text.chars().count());
+            self.restore_cursor = true;
+            self.search_dirty = true;
+            self.match_range = None;
+            self.commit_undo();
+        } else {
+            let source: Vec<String> = self.text.split('\n').map(str::to_owned).collect();
+            let Some(cmp) = self.compare.as_mut() else {
+                return;
+            };
+            cmp.left_history.record(&cmp.left, cmp.left_cursor);
+            let mut target: Vec<String> = cmp.left.split('\n').map(str::to_owned).collect();
+            for block in blocks.iter().rev() {
+                let start = block.left_start.min(target.len());
+                let end = start.saturating_add(block.left_len).min(target.len());
+                let source_end = block.right_start.saturating_add(block.right_len).min(source.len());
+                let replacement = source[block.right_start.min(source.len())..source_end].to_vec();
+                target.splice(start..end, replacement);
+            }
+            cmp.left = target.join("\n");
+            cmp.left_cursor = cmp.left_cursor.min(cmp.left.chars().count());
+            cmp.left_restore_cursor = true;
+            cmp.left_history.record(&cmp.left, cmp.left_cursor);
+            cmp.diff_dirty = true;
+            self.compare_left_focused = true;
+        }
+        self.mark_compare_dirty();
+        self.msg = match (index, left_to_right) {
+            (Some(_), true) => "Änderungsblock von Alt nach Neu übernommen.".into(),
+            (None, true) => "Alle Änderungen von Alt nach Neu übernommen.".into(),
+            (Some(_), false) => "Änderungsblock von Neu nach Alt übernommen.".into(),
+            (None, false) => "Alle Änderungen von Neu nach Alt übernommen.".into(),
+        };
+    }
+
+    /// Überträgt die aktuelle Textauswahl zwischen den Vergleichsseiten.
+    fn transfer_compare_selection(&mut self, left_to_right: bool) {
+        let Some(cmp) = self.compare.as_ref() else {
+            return;
+        };
+        let (source, selection, target_selection, target_cursor) = if left_to_right {
+            (
+                cmp.left.clone(),
+                cmp.left_selection,
+                cmp.right_selection,
+                self.cursor,
+            )
+        } else {
+            (
+                self.text.clone(),
+                cmp.right_selection,
+                cmp.left_selection,
+                cmp.left_cursor,
+            )
+        };
+        let Some((start, end)) = selection else {
+            self.msg = "Markiere zuerst einen Textbereich auf der Quellseite.".into();
+            return;
+        };
+        if start >= end {
+            return;
+        }
+        let from = byte_index(&source, start);
+        let to = byte_index(&source, end);
+        let inserted = source[from..to].to_owned();
+        let (replace_start, replace_end) = target_selection.unwrap_or((target_cursor, target_cursor));
+        if left_to_right {
+            self.commit_undo();
+            let a = byte_index(&self.text, replace_start);
+            let b = byte_index(&self.text, replace_end);
+            self.text.replace_range(a..b, &inserted);
+            self.cursor = replace_start + inserted.chars().count();
+            self.restore_cursor = true;
+            self.search_dirty = true;
+            self.match_range = None;
+            self.mark_compare_dirty();
+            self.commit_undo();
+        } else if let Some(cmp) = self.compare.as_mut() {
+            cmp.left_history.record(&cmp.left, cmp.left_cursor);
+            let a = byte_index(&cmp.left, replace_start);
+            let b = byte_index(&cmp.left, replace_end);
+            cmp.left.replace_range(a..b, &inserted);
+            cmp.left_cursor = replace_start + inserted.chars().count();
+            cmp.left_restore_cursor = true;
+            cmp.left_history.record(&cmp.left, cmp.left_cursor);
+            cmp.diff_dirty = true;
+            self.compare_left_focused = true;
+        }
+        self.msg = if left_to_right {
+            "Markierter Text von Alt nach Neu übernommen.".into()
+        } else {
+            "Markierter Text von Neu nach Alt übernommen.".into()
+        };
+    }
+
+    /// Speichert den aktuellen Ergebnisstand als separate Datei.
+    fn save_compare_result(&mut self) {
+        let extension = match self.fmt {
+            Fmt::Json => "json",
+            Fmt::Xml => "xml",
+            Fmt::Yaml => "yaml",
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&format!("Vergleichsergebnis.{extension}"))
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, &self.text) {
+            Ok(()) => self.msg = format!("Vergleichsergebnis gespeichert: {}", path.display()),
+            Err(e) => self.msg = format!("Speichern fehlgeschlagen: {e}"),
+        }
+    }
+
+    /// Speichert die linke Vergleichsseite als separate Datei.
+    fn save_compare_left(&mut self) {
+        let Some(cmp) = self.compare.as_ref() else {
+            return;
+        };
+        let extension = match cmp.left_fmt {
+            Fmt::Json => "json",
+            Fmt::Xml => "xml",
+            Fmt::Yaml => "yaml",
+        };
+        let stem = Path::new(&cmp.left_title)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Vergleich-Alt");
+        let name = format!("{stem}-alt.{extension}");
+        let text = cmp.left.clone();
+        let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() else {
+            return;
+        };
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                if let Some(cmp) = self.compare.as_mut() {
+                    cmp.left_saved_text = cmp.left.clone();
+                }
+                self.msg = format!("Linke Vergleichsseite gespeichert: {}", path.display());
+            }
+            Err(e) => self.msg = format!("Speichern fehlgeschlagen: {e}"),
+        }
+    }
+
+    fn save_active_document(&mut self) {
+        if self.compare_left_focused {
+            self.save_compare_left();
+        } else {
+            self.save();
+        }
     }
 
     fn open(&mut self) {
@@ -3363,6 +3619,11 @@ impl App {
         let jump_right = block.map(|b| b.right_start);
         let restore = self.restore_cursor;
         let cursor = self.cursor;
+        let left_title = if cmp.left == cmp.left_saved_text {
+            cmp.left_title.clone()
+        } else {
+            format!("{} *", cmp.left_title)
+        };
 
         let (left, right) = if cmp.side_by_side {
             let mut left_out = None;
@@ -3370,15 +3631,15 @@ impl App {
             ui.columns(2, |cols| {
                 left_out = Some(compare_pane(
                     &mut cols[0],
-                    "Alt",
+                    &left_title,
                     &mut cmp.left,
                     &cmp.diff.left,
-                    fmt,
+                    cmp.left_fmt,
                     &mut cmp.left_hl,
                     scroll,
-                    false,
-                    false,
-                    0,
+                    true,
+                    cmp.left_restore_cursor,
+                    cmp.left_cursor,
                     jump_left,
                     &[],
                     None,
@@ -3411,15 +3672,15 @@ impl App {
                 .allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
                     compare_pane(
                         ui,
-                        "Alt",
+                        &left_title,
                         &mut cmp.left,
                         &cmp.diff.left,
-                        fmt,
+                        cmp.left_fmt,
                         &mut cmp.left_hl,
                         scroll,
-                        false,
-                        false,
-                        0,
+                        true,
+                        cmp.left_restore_cursor,
+                        cmp.left_cursor,
                         jump_left,
                         &[],
                         None,
@@ -3453,6 +3714,15 @@ impl App {
         // wirken auf sie.
         self.editor_id = Some(right.id);
         self.cursor = right.cursor;
+        self.compare_left_focused = left.focused;
+        cmp.left_cursor = left.cursor;
+        cmp.left_restore_cursor = false;
+        cmp.left_selection = left.selection;
+        cmp.right_selection = right.selection;
+        if left.changed {
+            cmp.left_history.record(&cmp.left, left.cursor);
+            cmp.diff_dirty = true;
+        }
         if restore {
             self.restore_cursor = false;
         }
@@ -4083,7 +4353,7 @@ impl App {
                             self.open();
                         }
                         if ribbon_button(ui, Icon::Save, "Speichern", true, "Speichern (Strg+S)") {
-                            self.save();
+                            self.save_active_document();
                         }
                         let can_reload = self.path.is_some();
                         if ribbon_button(
@@ -4110,12 +4380,24 @@ impl App {
                 }
                 RibbonTab::Bearbeiten => {
                     ribbon_group(ui, "Rückgängig", 2, |ui| {
-                        let can_undo = self.history.can_undo();
+                        let can_undo = if self.compare_left_focused {
+                            self.compare
+                                .as_ref()
+                                .is_some_and(|c| c.left_history.can_undo())
+                        } else {
+                            self.history.can_undo()
+                        };
                         if ribbon_button(ui, Icon::Undo, "Zurück", can_undo, "Rückgängig (Strg+Z)")
                         {
                             self.undo();
                         }
-                        let can_redo = self.history.can_redo();
+                        let can_redo = if self.compare_left_focused {
+                            self.compare
+                                .as_ref()
+                                .is_some_and(|c| c.left_history.can_redo())
+                        } else {
+                            self.history.can_redo()
+                        };
                         if ribbon_button(
                             ui,
                             Icon::Redo,
@@ -4255,7 +4537,7 @@ impl App {
                     }
                 }
                 RibbonTab::Vergleichen => {
-                    ribbon_group(ui, "Vergleich", 2, |ui| {
+                    ribbon_group(ui, "Vergleich", 3, |ui| {
                         if ribbon_button(
                             ui,
                             Icon::Compare,
@@ -4264,6 +4546,15 @@ impl App {
                             "Aktuellen Inhalt formatieren und als Vorher/Nachher vergleichen",
                         ) {
                             self.start_compare_format();
+                        }
+                        if ribbon_button(
+                            ui,
+                            Icon::Open,
+                            "Datei…",
+                            true,
+                            "Ausgewählte Datei mit dem aktuellen Inhalt vergleichen",
+                        ) {
+                            self.compare_file();
                         }
                         let can_saved = self.path.is_some() || !self.saved_text.is_empty();
                         if ribbon_button(
@@ -4325,6 +4616,108 @@ impl App {
                                 "Nächster Änderungsblock",
                             ) {
                                 self.compare_step(true);
+                            }
+                        });
+                        ribbon_group(ui, "Übernehmen", 5, |ui| {
+                            if ribbon_button(
+                                ui,
+                                Icon::Compare,
+                                "Block →",
+                                has_changes,
+                                "Aktuellen Änderungsblock von Alt nach Neu übernehmen",
+                            ) {
+                                let index = self
+                                    .compare
+                                    .as_ref()
+                                    .and_then(|c| c.change_idx)
+                                    .or(Some(0));
+                                self.take_compare_change(index, true);
+                            }
+                            if ribbon_button(
+                                ui,
+                                Icon::Compare,
+                                "Alle →",
+                                has_changes,
+                                "Alle Änderungen von Alt nach Neu übernehmen",
+                            ) {
+                                self.take_compare_change(None, true);
+                            }
+                            if ribbon_button(
+                                ui,
+                                Icon::Compare,
+                                "← Block",
+                                has_changes,
+                                "Aktuellen Änderungsblock von Neu nach Alt übernehmen",
+                            ) {
+                                let index = self
+                                    .compare
+                                    .as_ref()
+                                    .and_then(|c| c.change_idx)
+                                    .or(Some(0));
+                                self.take_compare_change(index, false);
+                            }
+                            if ribbon_button(
+                                ui,
+                                Icon::Compare,
+                                "← Alle",
+                                has_changes,
+                                "Alle Änderungen von Neu nach Alt übernehmen",
+                            ) {
+                                self.take_compare_change(None, false);
+                            }
+                            if ribbon_button(
+                                ui,
+                                Icon::Reload,
+                                "Verwerfen",
+                                has_changes,
+                                "Aktuelle Änderungen in Neu zurückweisen und auf Alt zurücksetzen",
+                            ) {
+                                let index = self
+                                    .compare
+                                    .as_ref()
+                                    .and_then(|c| c.change_idx)
+                                    .or(Some(0));
+                                self.take_compare_change(index, true);
+                            }
+                        });
+                        ribbon_group(ui, "Textauswahl", 2, |ui| {
+                            if ribbon_button(
+                                ui,
+                                Icon::Compare,
+                                "→ Einfügen",
+                                true,
+                                "Auswahl aus Alt an Cursor oder statt Auswahl in Neu einsetzen",
+                            ) {
+                                self.transfer_compare_selection(true);
+                            }
+                            if ribbon_button(
+                                ui,
+                                Icon::Compare,
+                                "← Einfügen",
+                                true,
+                                "Auswahl aus Neu an Cursor oder statt Auswahl in Alt einsetzen",
+                            ) {
+                                self.transfer_compare_selection(false);
+                            }
+                        });
+                        ribbon_group(ui, "Ergebnis", 2, |ui| {
+                            if ribbon_button(
+                                ui,
+                                Icon::Save,
+                                "Alt speichern…",
+                                true,
+                                "Linke Vergleichsseite als separate Datei speichern",
+                            ) {
+                                self.save_compare_left();
+                            }
+                            if ribbon_button(
+                                ui,
+                                Icon::Save,
+                                "Speichern…",
+                                true,
+                                "Aktuellen Ergebnisstand als separate Datei speichern",
+                            ) {
+                                self.save_compare_result();
                             }
                         });
                         ribbon_group(ui, "Beenden", 1, |ui| {
@@ -4421,7 +4814,7 @@ impl eframe::App for App {
             self.undo();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&sc_save)) {
-            self.save();
+            self.save_active_document();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&sc_open)) {
             self.open();
